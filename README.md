@@ -3,7 +3,7 @@
 # Stroke Prediction Model Using R
 
 This project aims to build and deploy a **stroke prediction model** using patient demographic and clinical data.  
-It applies statistical and machine learning techniques in **R** to predict stroke risk and support early intervention in healthcare.
+It applies statistical techniques in **R** to predict stroke risk. The goal is be be able to predict whether a patient is likely to get stroke based on the input parameters like gender, age, various diseases, and smoking status. 
 
 ## Project Overview
 
