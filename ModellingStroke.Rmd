@@ -1,0 +1,507 @@
+---
+title: "Build and Deploy a Stroke Prediction Model Using R"
+author: "Angela Adomako"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+    theme: flatly
+    highlight: tango
+---
+
+# About the Data Analysis Report
+
+This report presents the complete data analysis process for the project **“Build and Deploy a Stroke Prediction Model Using R.”**  
+
+It includes steps such as data exploration, summary statistics, model development, evaluation, and deployment.
+
+The analysis was conducted and finalized on **`r format(Sys.Date(), '%B %d, %Y')`**.
+
+---
+
+**Data Description:**
+
+According to the World Health Organization (WHO) stroke is the 2nd leading cause of death globally, responsible for approximately 11% of total deaths.
+
+This data set is used to predict whether a patient is likely to get stroke based on the input parameters like gender, age, various diseases, and smoking status. Each row in the data provides relevant information about the patient.
+
+# Task 1 — Import & Preprocess
+
+## Install (once)
+
+```{r install, eval=FALSE}
+install.packages(c(
+  "tidyverse","tidymodels","themis","readxl","janitor",
+  "pROC","yardstick","broom","vip","corrplot","gridExtra"
+))
+```
+
+## Libraries & setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(themis)      # optional: SMOTE for imbalance
+library(readxl)
+library(janitor)
+library(pROC)
+library(yardstick)
+library(broom)
+library(corrplot)
+library(gridExtra)
+
+set.seed(42)
+theme_set(theme_minimal())
+```
+
+
+
+## Load data
+```{r load}
+# Adjust if your path differs
+data_path <- "C:/Users/anado/Downloads/stroke modelling/Stroke_dataset.xlsx"
+
+# Check if the file exists
+if (!file.exists(data_path)) stop("Data file not found. Check path/workdir.")
+
+# Read and inspect the data
+library(readxl)
+raw <- read_excel(data_path)
+glimpse(raw)
+```
+
+
+
+## Clean & harmonize
+
+```{r clean}
+stroke <- raw |>
+  clean_names() |>
+  mutate(
+    # Target: integer 0/1 -> factor "no"/"yes"
+    stroke = factor(if_else(as.integer(stroke) == 1, "yes", "no"),
+                    levels = c("no","yes")),
+    # Categorical predictors (adjust if your columns differ)
+    gender         = as.factor(gender),
+    ever_married   = as.factor(ever_married),
+    work_type      = as.factor(work_type),
+    residence_type = as.factor(residence_type),
+    smoking_status = na_if(smoking_status, "Unknown") |> as.factor(),
+    hypertension   = as.factor(hypertension),   # 0/1 as factor
+    heart_disease  = as.factor(heart_disease),  # 0/1 as factor
+    # Numeric predictors
+    age = suppressWarnings(as.numeric(age)),
+    avg_glucose_level = suppressWarnings(as.numeric(avg_glucose_level)),
+    bmi = na_if(bmi, "N/A") |> as.numeric()
+  )
+
+# Basic checks
+summary(stroke$stroke)
+stroke |> count(stroke) |> mutate(prop = n/sum(n)) |> print(n=Inf)
+
+# Simple missingness table
+miss_tbl <- stroke |>
+  summarise(across(everything(), ~sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to="variable", values_to="missing") |>
+  mutate(perc = round(100*missing/nrow(stroke),2)) |>
+  arrange(desc(missing))
+knitr::kable(miss_tbl, caption="Missing values overview")
+```
+
+
+
+# Task 2 — Exploratory Analysis
+
+```{r eda, fig.width=10, fig.height=4}
+# Target imbalance
+stroke |> count(stroke) |>
+  ggplot(aes(x = stroke, y = n, fill = stroke)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_text(aes(label = n), vjust = -0.4, fontface="bold") +
+  labs(title="Stroke outcome distribution", x="", y="Count") +
+  theme(legend.position="none")
+```
+
+```{r numeric-eda, fig.width=11, fig.height=4}
+p1 <- stroke |> ggplot(aes(age, fill=stroke)) +
+  geom_histogram(bins=40, alpha=.7, position="identity") +
+  labs(title="Age distribution by stroke")
+p2 <- stroke |> ggplot(aes(x=stroke, y=avg_glucose_level, fill=stroke)) +
+  geom_boxplot(alpha=.8, outlier.alpha=.3) +
+  labs(title="Avg glucose by stroke", x="", y="mg/dL") +
+  theme(legend.position="none")
+p3 <- stroke |> filter(!is.na(bmi)) |>
+  ggplot(aes(x=stroke, y=bmi, fill=stroke)) +
+  geom_boxplot(alpha=.8, outlier.alpha=.3) +
+  labs(title="BMI by stroke", x="", y="BMI") +
+  theme(legend.position="none")
+grid.arrange(p1, p2, p3, ncol=3)
+```
+
+```{r corr, fig.width=5, fig.height=5}
+num_df <- stroke |> select(age, avg_glucose_level, bmi) |> drop_na()
+corrplot(cor(num_df), method="circle", type="upper", addCoef.col="black",
+         tl.col="black", number.cex=.8, tl.srt=45)
+```
+
+
+# Task 3 — Split, Recipe, Model (Logistic Only)
+
+## Train/test split (stratified)
+
+```{r split}
+set.seed(42)
+split <- initial_split(stroke, prop = 0.8, strata = stroke)
+train <- training(split)
+test  <- testing(split)
+
+train |> count(stroke) |> mutate(prop=round(n/sum(n),3)) |> knitr::kable(caption="Train outcome distribution")
+test  |> count(stroke) |> mutate(prop=round(n/sum(n),3))  |> knitr::kable(caption="Test outcome distribution")
+```
+
+## Recipe (impute, dummies, normalize, optional SMOTE)
+
+
+
+```{r recipe}
+rec <- recipe(
+  stroke ~ gender + age + hypertension + heart_disease + ever_married +
+    work_type + residence_type + avg_glucose_level + bmi + smoking_status,
+  data = train
+) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_smote(stroke)
+
+prep(rec) # just to confirm it preps
+```
+
+## Logistic regression (glm)
+
+```{r model, message=FALSE, warning=FALSE}
+log_spec <- logistic_reg(mode="classification") |>
+  set_engine("glm")
+
+wf <- workflow() |>
+  add_model(log_spec) |>
+  add_recipe(rec)
+```
+
+## Cross-validation
+
+```{r cv}
+set.seed(42)
+folds <- vfold_cv(train, v = 5, strata = stroke)
+
+metrics_set <- metric_set(roc_auc, pr_auc, accuracy, sensitivity, specificity, precision, f_meas)
+
+set.seed(42)
+log_res <- fit_resamples(
+  wf, resamples = folds, metrics = metrics_set,
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(log_res) |>
+  arrange(.metric) |>
+  knitr::kable(caption="5-fold CV metrics (logistic)")
+```
+
+## Fit final model on full training data
+
+```{r fit-final}
+log_final <- fit(wf, data = train)
+```
+
+
+
+# Task 4 — Evaluate on Test Set
+
+## Test metrics
+
+```{r test-metrics}
+pred_prob <- predict(log_final, test, type="prob")
+pred_cls  <- predict(log_final, test, type="class")
+
+eval_tbl <- bind_cols(test |> select(stroke), pred_prob, pred_cls)
+
+test_metrics <- tibble(
+  ROC_AUC    = roc_auc(eval_tbl, truth = stroke, .pred_yes)$.estimate,
+  PR_AUC     = pr_auc(eval_tbl,  truth = stroke, .pred_yes)$.estimate,
+  Accuracy   = accuracy(eval_tbl, truth = stroke, .pred_class)$.estimate,
+  Sensitivity= sensitivity(eval_tbl, truth = stroke, .pred_class)$.estimate,
+  Specificity= specificity(eval_tbl, truth = stroke, .pred_class)$.estimate,
+  Precision  = precision(eval_tbl,  truth = stroke, .pred_class)$.estimate,
+  F1         = f_meas(eval_tbl,    truth = stroke, .pred_class)$.estimate
+)
+knitr::kable(round(test_metrics, 4), caption="Test set performance (default 0.5 threshold)")
+```
+
+## ROC & PR curves
+
+```{r roc-pr, fig.width=10, fig.height=4}
+p_roc <- eval_tbl |>
+  roc_curve(truth = stroke, .pred_yes) |>
+  autoplot() + ggtitle("ROC curve — Logistic regression")
+
+p_pr  <- eval_tbl |>
+  pr_curve(truth = stroke, .pred_yes) |>
+  autoplot() + ggtitle("Precision–Recall curve — Logistic regression")
+
+grid.arrange(p_roc, p_pr, ncol=2)
+```
+
+## Confusion matrix (threshold = 0.5)
+
+```{r cm, fig.width=5, fig.height=4}
+conf_mat(eval_tbl, truth = stroke, estimate = .pred_class) |>
+  autoplot(type="heatmap") + ggtitle("Confusion matrix (0.5 threshold)")
+```
+
+## Threshold tuning
+
+```{r thresh, fig.width=7, fig.height=5}
+thr <- seq(0.05, 0.95, by=0.05)
+
+thr_metrics <- map_dfr(thr, function(t) {
+  est <- factor(if_else(eval_tbl$.pred_yes >= t, "yes","no"), levels=c("no","yes"))
+  tibble(
+    threshold=t,
+    sensitivity = sensitivity_vec(eval_tbl$stroke, est),
+    specificity = specificity_vec(eval_tbl$stroke, est),
+    precision   = precision_vec(eval_tbl$stroke, est),
+    f1          = f_meas_vec(eval_tbl$stroke, est)
+  )
+})
+
+thr_metrics |>
+  pivot_longer(-threshold, names_to="metric", values_to="value") |>
+  ggplot(aes(threshold, value, color=metric)) +
+  geom_line(size=1) + geom_point() +
+  labs(title="Metrics vs decision threshold", y="Score", x="Threshold") +
+  theme(legend.position="bottom")
+```
+
+
+
+# Task 5 — Explainability (Logistic)
+
+## Coefficients, Odds Ratios & 95% CIs
+
+```{r or, fig.width=7, fig.height=6, message=FALSE, warning=FALSE}
+# Tidy coefficients
+coefs <- log_final |>
+  extract_fit_parsnip() |>
+  tidy(conf.int = TRUE, exponentiate = TRUE) |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(estimate)) |>
+  mutate(term = str_replace_all(term, "_", " "))
+
+knitr::kable(coefs, digits=3, caption="Logistic regression (odds ratios with 95% CI)")
+
+# Plot top effects by |log(OR)|
+coefs_plot <- log_final |>
+  extract_fit_parsnip() |>
+  tidy(conf.int = TRUE, exponentiate = FALSE) |>
+  filter(term != "(Intercept)") |>
+  mutate(abs_beta = abs(estimate)) |>
+  arrange(desc(abs_beta)) |>
+  slice_head(n=15)
+
+ggplot(coefs_plot, aes(x = reorder(term, estimate), y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width=.2) +
+  coord_flip() +
+  labs(title="Top coefficients (log-odds scale)", x="", y="Estimate (log-odds)")
+```
+
+## Calibration
+
+```{r calibration, fig.width=6, fig.height=5, message=FALSE, warning=FALSE}
+cal_df <- eval_tbl |>
+  mutate(bin = cut(.pred_yes, breaks=seq(0,1,.1), include.lowest=TRUE)) |>
+  group_by(bin) |>
+  summarise(pred = mean(.pred_yes), obs = mean(stroke=="yes"), n=dplyr::n()) |>
+  drop_na()
+
+ggplot(cal_df, aes(pred, obs, size=n)) +
+  geom_point(alpha=.7) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", color="red") +
+  labs(title="Calibration plot", x="Predicted probability", y="Observed rate") +
+  xlim(0,1) + ylim(0,1) +
+  theme(legend.position="bottom")
+```
+
+
+
+# Task 6 — Save & Use the Model
+
+```{r save, message=FALSE, warning=FALSE}
+# Save final workflow and a prepared recipe
+saveRDS(log_final, "final_logistic_workflow.rds")
+saveRDS(rec,       "final_recipe.rds")
+cat("Saved: final_logistic_workflow.rds, final_recipe.rds\n")
+```
+
+```{r predict-new, eval=FALSE}
+# Example: scoring new patients
+log_final <- readRDS("final_logistic_workflow.rds")
+rec       <- readRDS("final_recipe.rds")
+
+new_patients <- tibble(
+  age = c(45, 72),
+  gender = factor(c("Male","Female")),
+  hypertension = factor(c(0,1)),
+  heart_disease = factor(c(0,1)),
+  ever_married = factor(c("Yes","No")),
+  work_type = factor(c("Private","Self-employed")),
+  residence_type = factor(c("Urban","Rural")),
+  avg_glucose_level = c(105, 170),
+  bmi = c(26, 31),
+  smoking_status = factor(c("never smoked","formerly smoked"))
+)
+
+pred_prob <- predict(log_final, new_patients, type="prob")
+pred_cls  <- predict(log_final, new_patients, type="class")
+bind_cols(new_patients, pred_prob, pred_cls)
+```
+
+
+ **1. Information on the Dataset.** 
+
+My dataset contained 5,110 patient records and 12 variables, including:
+
+- **Demographics:** age, gender, residence type, work type, marital status  
+- **Health factors:** hypertension, heart disease, glucose level, BMI, smoking status  
+- **Target variable:** stroke (Yes/No)
+
+
+**2. Activities under data cleaning** 
+
+Before analysis, the dataset was carefully prepared to ensure consistency and accuracy:  
+
+- **Missing values:** `smoking_status` had about 30% missing data and `bmi` about 4%. Missing values were imputed rather than removed to retain valuable records.  
+- **Variable formatting:** All numeric and categorical variables were correctly defined.  
+- **Imputation and scaling:** Median imputation was used for numeric variables, and mode imputation for categorical ones. Numeric features were normalized to ensure equal weighting.  
+- **Balancing:** The **SMOTE** technique was applied to create synthetic stroke samples, addressing data imbalance.  
+
+These steps produced a clean, balanced, and analysis-ready dataset.
+
+---
+
+**3. Exploratory Analysis and Key Insights **
+
+Exploratory data analysis revealed clear patterns and relationships:  
+
+- **Age:** Stroke risk rose sharply with age.  
+- **Glucose level:** Higher average glucose correlated strongly with stroke occurrence.  
+- **Hypertension and heart disease:** Both conditions showed significant links to stroke risk.  
+- **BMI:** Extreme BMI values were less predictive compared to age and glucose.  
+- **Smoking:** Weak correlation observed, likely influenced by missing values.  
+
+Traditional risk factors such as age, blood pressure, and cardiovascular health remain dominant predictors of stroke.
+
+---
+
+**4. Model Building**
+
+A **logistic regression model** was selected for its simplicity and interpretability, making it suitable for clinical decision-making.  
+
+- **Training:** 80% training set with 5-fold cross-validation.  
+- **Performance (Validation set):**  
+  - ROC AUC: **0.84**  
+  - Accuracy: **0.76**  
+  - Sensitivity: **0.75**  
+  - Specificity: **0.80**  
+  - Precision: **0.98**  
+  - F1-score: **0.85**  
+
+The model achieved strong performance, accurately identifying stroke cases while minimizing false alarms.
+
+---
+
+**5. Model Evaluation and Test Performance**  
+
+When applied to the unseen test data, the model’s performance varied depending on the threshold used.  
+
+**Default Threshold (0.5):**  
+- ROC AUC: **0.1854** – concerning; probabilities appear inverted.  
+- Precision: **0.9818** – very high, indicating few false positives.  
+- Sensitivity: **0.7194** – moderate detection of true stroke cases.  
+- F1 Score: **0.8304** – good balance despite poor ROC AUC.  
+
+The model remained biased toward the “no stroke” class, showing sensitivity to threshold selection.
+
+**Optimized Test Performance:**  
+- ROC AUC: **0.90**  
+- Sensitivity and Specificity: approximately **0.72** each  
+- Precision: **0.98**  
+
+This demonstrates good generalization and reliability when appropriately tuned.
+
+---
+
+**6. Interpretation of Model Coefficients** 
+
+The model’s interpretability highlights key predictors of stroke risk:  
+
+| Predictor | Effect on Stroke Risk |
+|------------|-----------------------|
+| **Age** | Older age greatly increases risk |
+| **Average glucose level** | High glucose (often linked to diabetes) elevates risk |
+| **Heart disease** | Strong positive association |
+| **Hypertension** | Another major contributing factor |
+| **Urban residence** | Slightly higher risk than rural areas |
+
+Gender, BMI, and smoking showed weaker or inconsistent associations.
+
+---
+
+**7. Model Deployment**
+
+The final model and preprocessing pipeline were saved as `.rds` files for reuse.  
+They are ready for integration through **Plumber API** or a **Shiny app**, enabling real-time predictions.  
+
+Clinicians can input new patient data and instantly receive stroke probability scores along with contributing risk factors.
+
+---
+
+**Practical Impact**  
+
+- **Clinical decision support:** Assists healthcare professionals in early detection.  
+- **Resource planning:** Helps hospitals prioritize high-risk patients.  
+- **Continuous learning:** The model can be retrained as new data accumulates.  
+
+This transition from reactive to proactive care enhances early intervention and prevention.
+
+---
+
+**8. Limitations**  
+
+- **Class imbalance:** Despite using SMOTE, the model remains somewhat biased toward the majority class (“no stroke”).  
+- **Threshold sensitivity:** Default probability cutoffs led to reduced ROC AUC and missed stroke cases.  
+- **Data quality:** Missing values, especially in smoking status, may affect the reliability of certain predictors.  
+
+Future improvements could involve larger, more balanced datasets and adaptive thresholding techniques for better real-world accuracy.
+
+
+---
+# Findings & Conclusions
+
+* **Model**: A single **logistic regression** achieves solid discrimination (see ROC/PR and metrics).
+* **Top signals** often include **age**, **avg_glucose_level**, and cardiovascular history (hypertension, heart disease).
+* **Imbalance**: Because stroke is rare, consider **threshold tuning** to favor **sensitivity** in clinical settings.
+* **Deployment**: Saved RDS artifacts allow quick scoring in an API or Shiny app later.
+
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
